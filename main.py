@@ -1219,6 +1219,304 @@ class PreviewManager:
         self.app.set_status(f"Deleted screenshot: {image_name}")
 
 
+class DrawingManager:
+    def __init__(self, app):
+        self.app = app
+        self.overlay = None
+        self.toolbar = None
+        self.canvas = None
+        self.tool = "pencil"
+        self.color = "#f61d2a"
+        self.start_point = None
+        self.last_point = None
+        self.preview_item = None
+        self.background_photo = None
+        self.annotation_image = None
+        self.annotation_draw = None
+        self.tool_buttons = {}
+        self.color_buttons = {}
+        self.was_visible_for_capture = False
+
+    def is_visible(self):
+        return self.overlay is not None and self.overlay.winfo_exists() and self.overlay.state() != "withdrawn"
+
+    def toggle(self):
+        if self.is_visible():
+            self.hide(clear=False)
+            self.app.set_status("Draw hidden.")
+        else:
+            self.show()
+
+    def show(self):
+        self.app.root.withdraw()
+        self.app.root.update()
+        background = capture_image()
+
+        if self.overlay is None or not self.overlay.winfo_exists():
+            self._build_overlay(background)
+        else:
+            self._load_background(background)
+        if self.toolbar is None or not self.toolbar.winfo_exists():
+            self._build_toolbar()
+
+        self.overlay.deiconify()
+        self.overlay.lift()
+        self.overlay.attributes("-topmost", True)
+        self.overlay.focus_force()
+        self.app.root.deiconify()
+        self.app.root.lift()
+        self.app.root.attributes("-topmost", True)
+        self.toolbar.deiconify()
+        self.toolbar.lift()
+        self.toolbar.attributes("-topmost", True)
+        self._bring_controls_to_front()
+        self._apply_cursor()
+        self._update_button_states()
+        self.app.set_status("Draw mode on. Draw on the screen, then press Shot.")
+
+    def hide(self, clear=False):
+        if self.toolbar is not None and self.toolbar.winfo_exists():
+            self.toolbar.withdraw()
+        if self.overlay is not None and self.overlay.winfo_exists():
+            self.overlay.withdraw()
+        if clear and self.canvas is not None and self.canvas.winfo_exists():
+            self.canvas.delete("all")
+            self.annotation_image = None
+            self.annotation_draw = None
+            self.background_photo = None
+        self.start_point = None
+        self.last_point = None
+        self.preview_item = None
+
+    def _build_overlay(self, background):
+        screen_width, screen_height = background.size
+        self.overlay = tk.Toplevel(self.app.root)
+        self.overlay.overrideredirect(True)
+        self.overlay.attributes("-topmost", True)
+        self.overlay.geometry(f"{screen_width}x{screen_height}+0+0")
+        self.overlay.configure(bg="black")
+
+        self.canvas = tk.Canvas(
+            self.overlay,
+            width=screen_width,
+            height=screen_height,
+            bg="black",
+            highlightthickness=0,
+            cursor="crosshair",
+        )
+        self.canvas.pack(fill="both", expand=True)
+        self.canvas.bind("<ButtonPress-1>", self.start_draw)
+        self.canvas.bind("<B1-Motion>", self.drag_draw)
+        self.canvas.bind("<ButtonRelease-1>", self.end_draw)
+        self.overlay.bind("<Escape>", lambda _event: self.hide(clear=False))
+        self._load_background(background)
+
+    def _load_background(self, background):
+        if self.canvas is None or not self.canvas.winfo_exists():
+            return
+        self.annotation_image = Image.new("RGBA", background.size, (0, 0, 0, 0))
+        self.annotation_draw = ImageDraw.Draw(self.annotation_image)
+        self.background_photo = ImageTk.PhotoImage(background)
+        self.canvas.delete("all")
+        self.canvas.config(width=background.width, height=background.height)
+        self.canvas.create_image(0, 0, image=self.background_photo, anchor="nw", tags=("background",))
+        self.canvas.tag_lower("background")
+
+    def _build_toolbar(self):
+        self.toolbar = tk.Toplevel(self.app.root)
+        self.toolbar.overrideredirect(True)
+        self.toolbar.attributes("-topmost", True)
+        self.toolbar.configure(bg=CARD_BG)
+        self.toolbar.geometry("+80+80")
+
+        frame = tk.Frame(self.toolbar, bg=CARD_BG, bd=1, relief="solid")
+        frame.pack()
+
+        tool_specs = (
+            ("pencil", "\u270e"),
+            ("line", "/"),
+            ("rect", "\u25a1"),
+            ("circle", "\u25cb"),
+        )
+        for tool_name, icon in tool_specs:
+            button = tk.Button(
+                frame,
+                text=icon,
+                width=2,
+                relief="flat",
+                bd=0,
+                bg=CARD_BG,
+                fg=TEXT_DARK,
+                activebackground="#eef2ff",
+                command=lambda name=tool_name: self.set_tool(name),
+            )
+            button.pack(side="left", padx=2, pady=3)
+            self.tool_buttons[tool_name] = button
+
+        for color in ("#f61d2a", "#f7d038", "#188038", "#1a73e8", "#111827"):
+            button = tk.Button(
+                frame,
+                width=2,
+                relief="flat",
+                bd=0,
+                bg=color,
+                activebackground=color,
+                command=lambda value=color: self.set_color(value),
+            )
+            button.pack(side="left", padx=2, pady=3)
+            self.color_buttons[color] = button
+
+    def set_tool(self, tool):
+        self.tool = tool
+        self._apply_cursor()
+        self._update_button_states()
+        self._bring_controls_to_front()
+
+    def set_color(self, color):
+        self.color = color
+        self._update_button_states()
+        self._bring_controls_to_front()
+
+    def _update_button_states(self):
+        for tool, button in self.tool_buttons.items():
+            if button.winfo_exists():
+                button.configure(bg="#e8edff" if tool == self.tool else CARD_BG)
+        for color, button in self.color_buttons.items():
+            if button.winfo_exists():
+                button.configure(relief="solid" if color == self.color else "flat", bd=2 if color == self.color else 0)
+
+    def _apply_cursor(self):
+        if self.canvas is None or not self.canvas.winfo_exists():
+            return
+        cursor_by_tool = {
+            "pencil": "pencil",
+            "line": "crosshair",
+            "rect": "crosshair",
+            "circle": "crosshair",
+        }
+        self.canvas.configure(cursor=cursor_by_tool.get(self.tool, "crosshair"))
+
+    def _bring_controls_to_front(self):
+        if self.overlay is not None and self.overlay.winfo_exists():
+            self.overlay.attributes("-topmost", True)
+            try:
+                self.overlay.lower(self.app.root)
+            except tk.TclError:
+                pass
+        if self.app.root is not None and self.app.root.winfo_exists():
+            self.app.root.deiconify()
+            self.app.root.attributes("-topmost", True)
+            self.app.root.lift()
+        if self.toolbar is not None and self.toolbar.winfo_exists():
+            self.toolbar.deiconify()
+            self.toolbar.attributes("-topmost", True)
+            self.toolbar.lift()
+
+    def start_draw(self, event):
+        self.start_point = (event.x, event.y)
+        self.last_point = (event.x, event.y)
+        self.preview_item = None
+
+    def drag_draw(self, event):
+        if self.canvas is None or self.start_point is None:
+            return
+
+        if self.tool == "pencil":
+            self.canvas.create_line(
+                self.last_point[0],
+                self.last_point[1],
+                event.x,
+                event.y,
+                fill=self.color,
+                width=3,
+                capstyle=tk.ROUND,
+                smooth=True,
+            )
+            if self.annotation_draw is not None:
+                self.annotation_draw.line(
+                    (self.last_point[0], self.last_point[1], event.x, event.y),
+                    fill=self.color,
+                    width=3,
+                )
+            self.last_point = (event.x, event.y)
+            return
+
+        if self.preview_item is not None:
+            self.canvas.delete(self.preview_item)
+
+        x1, y1 = self.start_point
+        x2, y2 = event.x, event.y
+        if self.tool == "line":
+            self.preview_item = self.canvas.create_line(x1, y1, x2, y2, fill=self.color, width=3)
+        elif self.tool == "rect":
+            if event.state & 0x0001:
+                x2, y2 = self._square_endpoint(x1, y1, x2, y2)
+            self.preview_item = self.canvas.create_rectangle(x1, y1, x2, y2, outline=self.color, width=3)
+        elif self.tool == "circle":
+            x2, y2 = self._square_endpoint(x1, y1, x2, y2)
+            self.preview_item = self.canvas.create_oval(x1, y1, x2, y2, outline=self.color, width=3)
+
+    def end_draw(self, event):
+        if self.tool != "pencil":
+            self.drag_draw(event)
+            if self.annotation_draw is not None and self.start_point is not None:
+                x1, y1 = self.start_point
+                x2, y2 = event.x, event.y
+                if self.tool == "line":
+                    self.annotation_draw.line((x1, y1, x2, y2), fill=self.color, width=3)
+                elif self.tool == "rect":
+                    if event.state & 0x0001:
+                        x2, y2 = self._square_endpoint(x1, y1, x2, y2)
+                    self.annotation_draw.rectangle(self._ordered_bbox(x1, y1, x2, y2), outline=self.color, width=3)
+                elif self.tool == "circle":
+                    x2, y2 = self._square_endpoint(x1, y1, x2, y2)
+                    self.annotation_draw.ellipse(self._ordered_bbox(x1, y1, x2, y2), outline=self.color, width=3)
+        self.start_point = None
+        self.last_point = None
+        self.preview_item = None
+        self._bring_controls_to_front()
+        if self.overlay is not None and self.overlay.winfo_exists():
+            self.overlay.after(80, self._bring_controls_to_front)
+
+    def _square_endpoint(self, x1, y1, x2, y2):
+        side = max(abs(x2 - x1), abs(y2 - y1))
+        x2 = x1 + side if x2 >= x1 else x1 - side
+        y2 = y1 + side if y2 >= y1 else y1 - side
+        return x2, y2
+
+    def _ordered_bbox(self, x1, y1, x2, y2):
+        left, right = sorted((x1, x2))
+        top, bottom = sorted((y1, y2))
+        return left, top, right, bottom
+
+    def prepare_for_capture(self):
+        self.was_visible_for_capture = self.is_visible()
+        if self.toolbar is not None and self.toolbar.winfo_exists():
+            self.toolbar.withdraw()
+        if self.overlay is not None and self.overlay.winfo_exists():
+            self.overlay.withdraw()
+        self.app.root.update()
+
+    def apply_to_screenshot(self, screenshot, exclude_taskbar=False):
+        if self.annotation_image is None:
+            return screenshot
+
+        annotation = self.annotation_image
+        if exclude_taskbar:
+            left, top, right, bottom = get_workarea_bbox()
+            annotation = annotation.crop((left, top, right, bottom))
+
+        base = screenshot.convert("RGBA")
+        if annotation.size != base.size:
+            annotation = annotation.resize(base.size, Image.Resampling.LANCZOS)
+        return Image.alpha_composite(base, annotation).convert("RGB")
+
+    def finish_capture(self):
+        if self.was_visible_for_capture:
+            self.hide(clear=True)
+            self.was_visible_for_capture = False
+
+
 class HotkeyManager:
     def __init__(self, app):
         self.app = app
@@ -1337,6 +1635,7 @@ class App:
         self.document_manager = DocumentManager(self)
         self.note_manager = NoteManager(self, self.document_manager)
         self.preview_manager = PreviewManager(self, self.document_manager)
+        self.drawing_manager = DrawingManager(self)
         self.hotkey_manager = HotkeyManager(self)
         self._main_thread_actions = queue.Queue()
 
@@ -1410,13 +1709,14 @@ class App:
 
         radius = 144
         button_specs = [
+            ("Note", self.note_manager.open_window, "Open the note window.", 0, 10, False),
+            ("Preview", self.preview_manager.open_window, "Browse earlier screenshots and add yellow highlights.", 45, 8, False),
+            ("Draw", self.drawing_manager.toggle, "Show drawing tools.", 90, 9, False),
+            ("i", self.open_info_window, "Show instructions.", 135, 18, False),
+            ("Close", self.close_app, "Close the floating tool.", 180, 9, False),
+            ("Move", None, "Drag this button to move the floating tool.", 225, 8, True),
             ("New", self.create_new_document, "Create a new Word document.", 270, 10, False),
-            ("File", self.document_manager.select_document, "Open an existing Word document.", 321, 10, False),
-            ("Note", self.note_manager.open_window, "Open the note window.", 12, 10, False),
-            ("Preview", self.preview_manager.open_window, "Browse earlier screenshots and add yellow highlights.", 63, 8, False),
-            ("i", self.open_info_window, "Show instructions.", 114, 18, False),
-            ("Close", self.close_app, "Close the floating tool.", 165, 9, False),
-            ("Move", None, "Drag this button to move the floating tool.", 216, 8, True),
+            ("File", self.document_manager.select_document, "Open an existing Word document.", 315, 10, False),
         ]
 
         for label, command, tooltip_text, angle_deg, label_size, is_move in button_specs:
@@ -1833,10 +2133,13 @@ class App:
             self.note_manager.save(close_after=False)
         if self.preview_manager.is_visible():
             self.preview_manager.save_current_note()
+        self.drawing_manager.prepare_for_capture()
 
         hidden_windows = []
         for window in self.root.winfo_children():
             if not isinstance(window, tk.Toplevel):
+                continue
+            if window is self.drawing_manager.overlay:
                 continue
             try:
                 if window.winfo_exists() and window.state() != "withdrawn":
@@ -1860,6 +2163,7 @@ class App:
 
         try:
             screenshot = capture_image(exclude_taskbar=exclude_taskbar)
+            screenshot = self.drawing_manager.apply_to_screenshot(screenshot, exclude_taskbar=exclude_taskbar)
             if use_region_selector:
                 region = self.select_capture_region(screenshot)
                 if region is None:
@@ -1891,6 +2195,7 @@ class App:
             capture_mode = "selected region" if use_region_selector else ("without taskbar" if exclude_taskbar else "with taskbar")
             self.set_status(f"Saved screenshot {capture_mode} to {img_path}")
         finally:
+            self.drawing_manager.finish_capture()
             self._restore_after_capture(hidden_windows)
 
     def _restore_after_capture(self, hidden_windows):
@@ -1998,6 +2303,7 @@ class App:
         if self.note_manager.window is not None and self.note_manager.window.winfo_exists():
             self.note_manager.window.destroy()
         self.hotkey_manager.stop()
+        self.drawing_manager.hide(clear=True)
         self.root.destroy()
 
     def run(self):
