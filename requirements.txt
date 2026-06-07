@@ -1,0 +1,11 @@
+pyautogui
+python-docx
+Pillow
+lxml
+pygetwindow
+pymsgbox
+pyperclip
+pyrect
+pyscreeze
+pytweening
+mouseinfo
