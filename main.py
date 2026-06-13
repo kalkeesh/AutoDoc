@@ -14,12 +14,15 @@ import pyautogui
 from PIL import Image, ImageDraw, ImageTk
 from docx import Document
 from docx.oxml import OxmlElement
-from docx.shared import Inches
+from docx.enum.text import WD_ALIGN_PARAGRAPH
+from docx.shared import Inches, Pt, RGBColor
 from docx.text.paragraph import Paragraph
 
 APP_BG = "#f3f3f3"
 PRIMARY_BLUE = "#4f6ff0"
 PRIMARY_RED = "#f61d2a"
+PRIMARY_GREEN = "#12a150"
+PRIMARY_GREY = "#7a8494"
 BUTTON_SHADOW = "#d3d3d3"
 SCREENSHOT_DIR = "screenshots"
 PREVIEW_NOTES_FILE = "preview_notes.json"
@@ -30,10 +33,11 @@ BASE_HEIGHT = 680
 MIN_SCALE = 0.70
 MAX_SCALE = 1.25
 TRANSPARENT_KEY = "#00ff00"
-SHOT_SHORTCUT_LABEL = "Ctrl+Alt+Q"
-WORKAREA_SHORTCUT_LABEL = "Ctrl+Alt+W"
+SHOT_SHORTCUT_LABEL = "Ctrl+Q"
+WORKAREA_SHORTCUT_LABEL = "Ctrl+W"
 PREVIEW_BRUSH_LEVELS = [8, 14, 22, 32]
 SHOT_SINGLE_CLICK_DELAY_MS = 420
+CAPTURE_HIDE_DELAY_MS = 700
 HOTKEY_ID = 1
 WORKAREA_HOTKEY_ID = 2
 MOD_ALT = 0x0001
@@ -43,6 +47,26 @@ WM_HOTKEY = 0x0312
 WM_QUIT = 0x0012
 VK_Q = 0x51
 VK_W = 0x57
+TESTCASE_STATUS_OPTIONS = {
+    "passed": {
+        "label": "Passed",
+        "document_text": "TESTCASE : PASSED",
+        "button_bg": PRIMARY_GREEN,
+        "text_color": RGBColor(18, 122, 67),
+    },
+    "failed": {
+        "label": "Failed",
+        "document_text": "TESTCASE : FAILED",
+        "button_bg": PRIMARY_RED,
+        "text_color": RGBColor(188, 28, 43),
+    },
+    "pending": {
+        "label": "Pending",
+        "document_text": "TESTCASE : PENDING - YET TO WORK",
+        "button_bg": PRIMARY_GREY,
+        "text_color": RGBColor(99, 108, 123),
+    },
+}
 
 
 def ensure_screenshot_dir():
@@ -293,6 +317,47 @@ class DocumentManager:
                 run.bold = True
                 run.italic = True
         return paragraph._element
+
+    def append_testcase_status(self, status_key):
+        if not self.has_document():
+            return False
+
+        status = TESTCASE_STATUS_OPTIONS.get(status_key)
+        if status is None:
+            return False
+
+        spacer = self.document.add_paragraph()
+        spacer.paragraph_format.space_before = Pt(8)
+        spacer.paragraph_format.space_after = Pt(0)
+
+        divider = self.document.add_paragraph()
+        divider.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        divider.paragraph_format.space_before = Pt(0)
+        divider.paragraph_format.space_after = Pt(4)
+        divider_run = divider.add_run("=" * 34)
+        divider_run.bold = True
+        divider_run.font.color.rgb = status["text_color"]
+
+        paragraph = self.document.add_paragraph()
+        paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        paragraph.paragraph_format.space_before = Pt(0)
+        paragraph.paragraph_format.space_after = Pt(8)
+
+        label_run = paragraph.add_run(status["document_text"])
+        label_run.bold = True
+        label_run.font.size = Pt(16)
+        label_run.font.color.rgb = status["text_color"]
+
+        footer = self.document.add_paragraph()
+        footer.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        footer.paragraph_format.space_after = Pt(8)
+        footer_run = footer.add_run(f"Closed on {datetime.now().strftime('%d-%m-%Y %H:%M')}")
+        footer_run.italic = True
+        footer_run.font.size = Pt(9)
+        footer_run.font.color.rgb = RGBColor(95, 105, 122)
+
+        self.save()
+        return True
 
     def set_image_note(self, image_path, note_text):
         if not self.has_document() or not image_path:
@@ -636,6 +701,9 @@ class PreviewManager:
         self.preview_drag_origin = None
         self.last_point = None
         self.loading_note = False
+        self.current_note_cache = ""
+        self.canvas_update_after_id = None
+        self.is_interacting = False
 
     def is_visible(self):
         return self.window is not None and self.window.winfo_exists() and self.window.state() != "withdrawn"
@@ -871,6 +939,8 @@ class PreviewManager:
         self._reset_state()
 
     def _reset_state(self):
+        if self.canvas_update_after_id is not None and self.window is not None and self.window.winfo_exists():
+            self.window.after_cancel(self.canvas_update_after_id)
         if self.note_save_after_id is not None and self.window is not None and self.window.winfo_exists():
             self.window.after_cancel(self.note_save_after_id)
         self.window = None
@@ -897,6 +967,9 @@ class PreviewManager:
         self.preview_drag_origin = None
         self.last_point = None
         self.loading_note = False
+        self.current_note_cache = ""
+        self.canvas_update_after_id = None
+        self.is_interacting = False
 
     def show_at(self, index):
         self.current_index = max(0, min(index, len(self.paths) - 1)) if self.paths else 0
@@ -938,6 +1011,7 @@ class PreviewManager:
             highlight_button.configure(fg="#b58900" if mode == "highlight" else TEXT_DARK)
 
     def start_interaction(self, event):
+        self.is_interacting = True
         self.preview_drag_origin = (event.x, event.y)
         if self.tool_mode == "highlight":
             self.last_point = self._canvas_to_image_coords(event)
@@ -963,7 +1037,7 @@ class PreviewManager:
             )
             self.last_point = point
             self.dirty = True
-            self.update_canvas()
+            self.request_canvas_update()
             return
 
         if self.preview_drag_origin is None:
@@ -975,17 +1049,34 @@ class PreviewManager:
         self.preview_drag_origin = (event.x, event.y)
         self.pan_x += dx
         self.pan_y += dy
-        self.update_canvas()
+        self.request_canvas_update()
 
     def end_interaction(self, _event):
         self.preview_drag_origin = None
         self.last_point = None
+        self.is_interacting = False
         if self.tool_mode == "highlight" and self.dirty:
             self.save_highlight()
+        else:
+            self.update_canvas()
+
+    def request_canvas_update(self):
+        if self.window is None or not self.window.winfo_exists():
+            return
+        if self.canvas_update_after_id is not None:
+            return
+        self.canvas_update_after_id = self.window.after(33, self._run_canvas_update)
+
+    def _run_canvas_update(self):
+        self.canvas_update_after_id = None
+        self.update_canvas()
 
     def update_canvas(self):
         if self.window is None or not self.window.winfo_exists() or self.canvas is None:
             return
+        if self.canvas_update_after_id is not None:
+            self.window.after_cancel(self.canvas_update_after_id)
+            self.canvas_update_after_id = None
 
         self.refresh_paths()
         if not self.paths:
@@ -1031,7 +1122,8 @@ class PreviewManager:
         render_scale = base_scale * self.zoom
         scaled_width = max(1, int(display_image.width * render_scale))
         scaled_height = max(1, int(display_image.height * render_scale))
-        scaled_image = display_image.resize((scaled_width, scaled_height), Image.Resampling.LANCZOS)
+        resample_filter = Image.Resampling.BILINEAR if self.is_interacting else Image.Resampling.LANCZOS
+        scaled_image = display_image.resize((scaled_width, scaled_height), resample_filter)
 
         max_pan_x = max(0, (scaled_width - viewport_width) / 2)
         max_pan_y = max(0, (scaled_height - viewport_height) / 2)
@@ -1063,7 +1155,10 @@ class PreviewManager:
         self.note_textbox.configure(state="normal")
         self.note_textbox.delete("1.0", tk.END)
         if self.current_image_path is not None:
-            self.note_textbox.insert("1.0", get_preview_note(self.current_image_path))
+            self.current_note_cache = get_preview_note(self.current_image_path)
+            self.note_textbox.insert("1.0", self.current_note_cache)
+        else:
+            self.current_note_cache = ""
         self.loading_note = False
 
     def schedule_note_save(self, _event=None):
@@ -1081,8 +1176,11 @@ class PreviewManager:
             return
 
         note_text = self.note_textbox.get("1.0", tk.END).strip()
+        if note_text == self.current_note_cache:
+            return
         set_preview_note(self.current_image_path, note_text)
         self.document_manager.set_image_note(self.current_image_path, note_text)
+        self.current_note_cache = note_text
 
     def _set_controls_enabled(self, enabled):
         state = "normal" if enabled else "disabled"
@@ -1495,7 +1593,7 @@ class DrawingManager:
             self.toolbar.withdraw()
         if self.overlay is not None and self.overlay.winfo_exists():
             self.overlay.withdraw()
-        self.app.root.update()
+        self.app.root.update_idletasks()
 
     def apply_to_screenshot(self, screenshot, exclude_taskbar=False):
         if self.annotation_image is None:
@@ -1536,12 +1634,12 @@ class HotkeyManager:
         kernel32 = ctypes.windll.kernel32
         self.thread_id = kernel32.GetCurrentThreadId()
 
-        if user32.RegisterHotKey(None, HOTKEY_ID, MOD_CONTROL | MOD_ALT, VK_Q):
+        if user32.RegisterHotKey(None, HOTKEY_ID, MOD_CONTROL, VK_Q):
             self.hotkey_registered = True
         else:
             self.app.schedule(self.app.set_status, f"Global shortcut unavailable: {SHOT_SHORTCUT_LABEL}")
 
-        if user32.RegisterHotKey(None, WORKAREA_HOTKEY_ID, MOD_CONTROL | MOD_ALT, VK_W):
+        if user32.RegisterHotKey(None, WORKAREA_HOTKEY_ID, MOD_CONTROL, VK_W):
             self.workarea_hotkey_registered = True
         else:
             self.app.schedule(self.app.set_status, f"Taskbar-free shortcut unavailable: {WORKAREA_SHORTCUT_LABEL}")
@@ -1628,9 +1726,12 @@ class App:
         self.status_label = None
         self.size_window = None
         self.size_slider = None
+        self.testcase_status_window = None
         self.tooltip_window = None
         self.toast_window = None
         self.toast_after_id = None
+        self.capture_in_progress = False
+        self.close_in_progress = False
 
         self.document_manager = DocumentManager(self)
         self.note_manager = NoteManager(self, self.document_manager)
@@ -1713,7 +1814,7 @@ class App:
             ("Preview", self.preview_manager.open_window, "Browse earlier screenshots and add yellow highlights.", 45, 8, False),
             ("Draw", self.drawing_manager.toggle, "Show drawing tools.", 90, 9, False),
             ("i", self.open_info_window, "Show instructions.", 135, 18, False),
-            ("Close", self.close_app, "Close the floating tool.", 180, 9, False),
+            ("Close", self.close_app, "Close the floating tool. Double-click to close with testcase status.", 180, 9, False),
             ("Move", None, "Drag this button to move the floating tool.", 225, 8, True),
             ("New", self.create_new_document, "Create a new Word document.", 270, 10, False),
             ("File", self.document_manager.select_document, "Open an existing Word document.", 315, 10, False),
@@ -1729,7 +1830,18 @@ class App:
             if is_move:
                 self._draw_move_button(button_left, button_top, satellite_size, PRIMARY_BLUE, label, tooltip_text, label_size=label_size)
             else:
-                self._draw_circle_button(button_left, button_top, satellite_size, PRIMARY_BLUE, label, command, tooltip_text, label_size=label_size)
+                double_command = self.open_testcase_status_window if label == "Close" else None
+                self._draw_circle_button(
+                    button_left,
+                    button_top,
+                    satellite_size,
+                    PRIMARY_BLUE,
+                    label,
+                    command,
+                    tooltip_text,
+                    label_size=label_size,
+                    double_command=double_command,
+                )
 
     def _draw_background(self):
         self.canvas.create_rectangle(
@@ -1947,6 +2059,11 @@ class App:
         if self.toast_window is not None and self.toast_window.winfo_exists():
             self.toast_window.destroy()
         self.toast_window = None
+        try:
+            if self.root.winfo_exists():
+                self.root.update_idletasks()
+        except tk.TclError:
+            pass
 
     def create_new_document(self):
         folder = filedialog.askdirectory(title="Select folder to save the new document")
@@ -2092,6 +2209,9 @@ class App:
             "- Opens this help window.\n"
             "- You can scroll here to read all instructions.\n\n"
             "Close button\n"
+            "- Click Close to finish normally.\n"
+            "- Double-click Close to choose Passed, Failed, or Pending before closing.\n"
+            "- The selected testcase status is added at the end of the active document in a designed format.\n"
             "- Before closing, if any note text is still pending, it is added at the end of the active document.\n"
             "- All temporary images in the screenshots folder are deleted after the save step completes.\n"
             "- Then the floating tool closes.\n\n"
@@ -2121,12 +2241,24 @@ class App:
         ).pack(anchor="e", padx=18, pady=(0, 16))
 
     def take_screenshot(self, exclude_taskbar=False, use_region_selector=False):
+        if self.capture_in_progress:
+            self.set_status("Capture already running. Please wait.")
+            return
+
         if not self.document_manager.has_document():
             messagebox.showwarning("No document", "Create or select a Word document first.")
             return
 
-        hidden_windows = self._hide_autodoc_windows_for_capture()
-        self.root.after(350, lambda: self._capture_after_hide(exclude_taskbar, use_region_selector, hidden_windows))
+        self.capture_in_progress = True
+        self.close_toast()
+        self.hide_tooltip()
+        try:
+            hidden_windows = self._hide_autodoc_windows_for_capture()
+        except Exception as exc:
+            self.capture_in_progress = False
+            messagebox.showerror("Capture failed", f"Could not prepare the screen for capture.\n\n{exc}")
+            return
+        self.root.after(CAPTURE_HIDE_DELAY_MS, lambda: self._capture_after_hide(exclude_taskbar, use_region_selector, hidden_windows))
 
     def _hide_autodoc_windows_for_capture(self):
         if self.note_manager.is_visible():
@@ -2151,7 +2283,7 @@ class App:
         self.hide_tooltip()
         self.close_toast()
         self.root.withdraw()
-        self.root.update()
+        self.root.update_idletasks()
         return hidden_windows
 
     def _capture_after_hide(self, exclude_taskbar, use_region_selector, hidden_windows):
@@ -2167,7 +2299,6 @@ class App:
             if use_region_selector:
                 region = self.select_capture_region(screenshot)
                 if region is None:
-                    self._restore_after_capture(hidden_windows)
                     self.set_status("Region capture cancelled.")
                     return
                 screenshot = screenshot.crop(region)
@@ -2197,6 +2328,7 @@ class App:
         finally:
             self.drawing_manager.finish_capture()
             self._restore_after_capture(hidden_windows)
+            self.capture_in_progress = False
 
     def _restore_after_capture(self, hidden_windows):
         self.root.deiconify()
@@ -2291,14 +2423,103 @@ class App:
     def set_status(self, message):
         self.status_var.set(message)
 
-    def close_app(self):
+    def open_testcase_status_window(self):
+        if self.close_in_progress:
+            self.set_status("Close already running. Please wait.")
+            return
+
+        if not self.document_manager.has_document():
+            messagebox.showwarning("No document", "Create or select a Word document first.")
+            return
+
+        if self.testcase_status_window is not None and self.testcase_status_window.winfo_exists():
+            self.testcase_status_window.deiconify()
+            self.testcase_status_window.lift()
+            self.testcase_status_window.focus_force()
+            return
+
+        x = self.root.winfo_x() + self.scaled(92)
+        y = self.root.winfo_y() + self.scaled(250)
+        self.testcase_status_window = tk.Toplevel(self.root)
+        self.testcase_status_window.title("Testcase Status")
+        self.testcase_status_window.geometry(f"330x170+{x}+{y}")
+        self.testcase_status_window.configure(bg=CARD_BG)
+        self.testcase_status_window.attributes("-topmost", True)
+        self.testcase_status_window.resizable(False, False)
+
+        tk.Label(
+            self.testcase_status_window,
+            text="End document as",
+            bg=CARD_BG,
+            fg=TEXT_DARK,
+            font=("Segoe UI Semibold", 13),
+        ).pack(anchor="w", padx=18, pady=(16, 4))
+
+        tk.Label(
+            self.testcase_status_window,
+            text="Choose testcase result before save and close.",
+            bg=CARD_BG,
+            fg="#5d6880",
+            font=("Segoe UI", 9),
+        ).pack(anchor="w", padx=18, pady=(0, 14))
+
+        button_frame = tk.Frame(self.testcase_status_window, bg=CARD_BG)
+        button_frame.pack(fill="x", padx=18)
+
+        for status_key in ("passed", "failed", "pending"):
+            status = TESTCASE_STATUS_OPTIONS[status_key]
+            tk.Button(
+                button_frame,
+                text=status["label"],
+                command=lambda key=status_key: self.close_app(testcase_status=key),
+                bg=status["button_bg"],
+                fg="white",
+                activebackground=status["button_bg"],
+                activeforeground="white",
+                relief="flat",
+                bd=0,
+                padx=10,
+                pady=10,
+                font=("Segoe UI Semibold", 9),
+            ).pack(side="left", expand=True, fill="x", padx=(0, 8) if status_key != "pending" else (0, 0))
+
+        tk.Button(
+            self.testcase_status_window,
+            text="Cancel",
+            command=self.testcase_status_window.destroy,
+            bg="#eef1f6",
+            fg=TEXT_DARK,
+            relief="flat",
+            bd=0,
+            padx=12,
+            pady=5,
+            font=("Segoe UI", 9),
+        ).pack(anchor="e", padx=18, pady=(14, 0))
+
+        self.testcase_status_window.protocol("WM_DELETE_WINDOW", self.testcase_status_window.destroy)
+        self.testcase_status_window.focus_force()
+        self.set_status("Choose testcase status to save and close.")
+
+    def close_app(self, testcase_status=None):
+        if self.close_in_progress:
+            self.set_status("Close already running. Please wait.")
+            return
+
+        self.close_in_progress = True
+        self.set_status("Saving and closing...")
+        self.root.update_idletasks()
         try:
             self.note_manager.append_pending_note_to_document()
+            if testcase_status is not None:
+                self.document_manager.append_testcase_status(testcase_status)
             clear_screenshot_dir()
         except Exception as exc:
+            self.close_in_progress = False
             messagebox.showerror("Close failed", f"Could not finish saving/cleanup before closing.\n\n{exc}")
             return
         self.close_toast()
+        if self.testcase_status_window is not None and self.testcase_status_window.winfo_exists():
+            self.testcase_status_window.destroy()
         self.preview_manager.close_window()
         if self.note_manager.window is not None and self.note_manager.window.winfo_exists():
             self.note_manager.window.destroy()
