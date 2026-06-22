@@ -15,7 +15,7 @@ from PIL import Image, ImageDraw, ImageTk
 from docx import Document
 from docx.oxml import OxmlElement
 from docx.enum.text import WD_ALIGN_PARAGRAPH
-from docx.shared import Inches, Pt, RGBColor
+from docx.shared import Pt, RGBColor
 from docx.text.paragraph import Paragraph
 
 APP_BG = "#f3f3f3"
@@ -35,11 +35,13 @@ MAX_SCALE = 1.25
 TRANSPARENT_KEY = "#00ff00"
 SHOT_SHORTCUT_LABEL = "Ctrl+Q"
 WORKAREA_SHORTCUT_LABEL = "Ctrl+W"
+DRAW_SHORTCUT_LABEL = "Ctrl+E"
 PREVIEW_BRUSH_LEVELS = [8, 14, 22, 32]
 SHOT_SINGLE_CLICK_DELAY_MS = 420
 CAPTURE_HIDE_DELAY_MS = 700
 HOTKEY_ID = 1
 WORKAREA_HOTKEY_ID = 2
+DRAW_HOTKEY_ID = 3
 MOD_ALT = 0x0001
 MOD_CONTROL = 0x0002
 SPI_GETWORKAREA = 0x0030
@@ -47,6 +49,7 @@ WM_HOTKEY = 0x0312
 WM_QUIT = 0x0012
 VK_Q = 0x51
 VK_W = 0x57
+VK_E = 0x45
 TESTCASE_STATUS_OPTIONS = {
     "passed": {
         "label": "Passed",
@@ -262,7 +265,11 @@ class DocumentManager:
     def _normalize_path(self, image_path):
         return os.path.abspath(image_path) if image_path else None
 
-    def append_image(self, image_path, width=Inches(5), note_element=None):
+    def _page_content_width(self):
+        section = self.document.sections[-1]
+        return section.page_width - section.left_margin - section.right_margin
+
+    def append_image(self, image_path, width=None, note_element=None):
         if not self.has_document() or not image_path:
             return
 
@@ -270,6 +277,8 @@ class DocumentManager:
         if absolute_path in self.tracked_images:
             self.remove_tracked_image(absolute_path)
 
+        if width is None:
+            width = self._page_content_width()
         picture = self.document.add_picture(image_path, width=width)
         paragraph = self.document.paragraphs[-1]
         self.tracked_images[absolute_path] = paragraph._element
@@ -1240,7 +1249,7 @@ class PreviewManager:
             if self.document_manager.has_document():
                 note_element = self.document_manager.tracked_notes.get(self.document_manager._normalize_path(self.current_image_path))
                 self.document_manager.remove_tracked_image(self.current_image_path, remove_note=False)
-                self.document_manager.append_image(self.current_image_path, width=Inches(5), note_element=note_element)
+                self.document_manager.append_image(self.current_image_path, note_element=note_element)
                 self.document_manager.save()
             self.update_canvas()
             self.app.set_status(
@@ -1280,7 +1289,7 @@ class PreviewManager:
         self.annotation_draw = Image.new("RGBA", self.base_image.size, (0, 0, 0, 0))
         note_element = self.document_manager.tracked_notes.get(self.document_manager._normalize_path(self.current_image_path))
         self.document_manager.remove_tracked_image(self.current_image_path, remove_note=False)
-        self.document_manager.append_image(self.current_image_path, width=Inches(5), note_element=note_element)
+        self.document_manager.append_image(self.current_image_path, note_element=note_element)
         self.document_manager.save()
         self.dirty = False
         self.refresh_paths()
@@ -1328,6 +1337,7 @@ class DrawingManager:
         self.start_point = None
         self.last_point = None
         self.preview_item = None
+        self.background_image = None
         self.background_photo = None
         self.annotation_image = None
         self.annotation_draw = None
@@ -1381,6 +1391,7 @@ class DrawingManager:
             self.canvas.delete("all")
             self.annotation_image = None
             self.annotation_draw = None
+            self.background_image = None
             self.background_photo = None
         self.start_point = None
         self.last_point = None
@@ -1412,12 +1423,27 @@ class DrawingManager:
     def _load_background(self, background):
         if self.canvas is None or not self.canvas.winfo_exists():
             return
+        self.background_image = background.convert("RGBA")
         self.annotation_image = Image.new("RGBA", background.size, (0, 0, 0, 0))
         self.annotation_draw = ImageDraw.Draw(self.annotation_image)
         self.background_photo = ImageTk.PhotoImage(background)
         self.canvas.delete("all")
         self.canvas.config(width=background.width, height=background.height)
         self.canvas.create_image(0, 0, image=self.background_photo, anchor="nw", tags=("background",))
+        self.canvas.tag_lower("background")
+
+    def _render_annotation_overlay(self):
+        if (
+            self.canvas is None
+            or not self.canvas.winfo_exists()
+            or self.background_image is None
+            or self.annotation_image is None
+        ):
+            return
+
+        display_image = Image.alpha_composite(self.background_image, self.annotation_image)
+        self.background_photo = ImageTk.PhotoImage(display_image.convert("RGB"))
+        self.canvas.itemconfigure("background", image=self.background_photo)
         self.canvas.tag_lower("background")
 
     def _build_toolbar(self):
@@ -1432,6 +1458,7 @@ class DrawingManager:
 
         tool_specs = (
             ("pencil", "\u270e"),
+            ("highlight", "H"),
             ("line", "/"),
             ("rect", "\u25a1"),
             ("circle", "\u25cb"),
@@ -1488,6 +1515,7 @@ class DrawingManager:
             return
         cursor_by_tool = {
             "pencil": "pencil",
+            "highlight": "pencil",
             "line": "crosshair",
             "rect": "crosshair",
             "circle": "crosshair",
@@ -1539,6 +1567,21 @@ class DrawingManager:
             self.last_point = (event.x, event.y)
             return
 
+        if self.tool == "highlight":
+            if self.annotation_draw is None:
+                return
+            if self.last_point is None:
+                self.last_point = (event.x, event.y)
+                return
+            self.annotation_draw.line(
+                (self.last_point[0], self.last_point[1], event.x, event.y),
+                fill=(255, 235, 59, 150),
+                width=PREVIEW_BRUSH_LEVELS[1],
+            )
+            self.last_point = (event.x, event.y)
+            self._render_annotation_overlay()
+            return
+
         if self.preview_item is not None:
             self.canvas.delete(self.preview_item)
 
@@ -1555,7 +1598,7 @@ class DrawingManager:
             self.preview_item = self.canvas.create_oval(x1, y1, x2, y2, outline=self.color, width=3)
 
     def end_draw(self, event):
-        if self.tool != "pencil":
+        if self.tool not in ("pencil", "highlight"):
             self.drag_draw(event)
             if self.annotation_draw is not None and self.start_point is not None:
                 x1, y1 = self.start_point
@@ -1622,6 +1665,7 @@ class HotkeyManager:
         self.thread_id = None
         self.hotkey_registered = False
         self.workarea_hotkey_registered = False
+        self.draw_hotkey_registered = False
 
     def start(self):
         if os.name != "nt":
@@ -1644,7 +1688,12 @@ class HotkeyManager:
         else:
             self.app.schedule(self.app.set_status, f"Taskbar-free shortcut unavailable: {WORKAREA_SHORTCUT_LABEL}")
 
-        if not self.hotkey_registered and not self.workarea_hotkey_registered:
+        if user32.RegisterHotKey(None, DRAW_HOTKEY_ID, MOD_CONTROL, VK_E):
+            self.draw_hotkey_registered = True
+        else:
+            self.app.schedule(self.app.set_status, f"Draw shortcut unavailable: {DRAW_SHORTCUT_LABEL}")
+
+        if not self.hotkey_registered and not self.workarea_hotkey_registered and not self.draw_hotkey_registered:
             return
 
         msg = wintypes.MSG()
@@ -1654,6 +1703,8 @@ class HotkeyManager:
                     self.app.schedule(self.app.take_screenshot)
                 elif msg.wParam == WORKAREA_HOTKEY_ID:
                     self.app.schedule(self.app.take_screenshot, exclude_taskbar=True)
+                elif msg.wParam == DRAW_HOTKEY_ID:
+                    self.app.schedule(self.app.toggle_draw_mode)
             user32.TranslateMessage(ctypes.byref(msg))
             user32.DispatchMessageW(ctypes.byref(msg))
 
@@ -1666,6 +1717,9 @@ class HotkeyManager:
         if self.workarea_hotkey_registered:
             user32.UnregisterHotKey(None, WORKAREA_HOTKEY_ID)
             self.workarea_hotkey_registered = False
+        if self.draw_hotkey_registered:
+            user32.UnregisterHotKey(None, DRAW_HOTKEY_ID)
+            self.draw_hotkey_registered = False
 
     def stop(self):
         if os.name != "nt":
@@ -1757,12 +1811,18 @@ class App:
 
         self.canvas = tk.Canvas(self.root, width=420, height=680, bg=TRANSPARENT_KEY, highlightthickness=0)
         self.canvas.pack(fill="both", expand=True)
+        self.root.bind_all("<Control-e>", self.toggle_draw_mode)
+        self.root.bind_all("<Control-E>", self.toggle_draw_mode)
 
     def scaled(self, value):
         return max(1, int(value * self.ui_scale))
 
     def take_region_screenshot(self):
         self.take_screenshot(use_region_selector=True)
+
+    def toggle_draw_mode(self, _event=None):
+        self.drawing_manager.toggle()
+        return "break"
 
     def schedule(self, callback, *args, **kwargs):
         self._main_thread_actions.put((callback, args, kwargs))
@@ -1811,13 +1871,12 @@ class App:
         radius = 144
         button_specs = [
             ("Note", self.note_manager.open_window, "Open the note window.", 0, 10, False),
-            ("Preview", self.preview_manager.open_window, "Browse earlier screenshots and add yellow highlights.", 45, 8, False),
-            ("Draw", self.drawing_manager.toggle, "Show drawing tools.", 90, 9, False),
-            ("i", self.open_info_window, "Show instructions.", 135, 18, False),
-            ("Close", self.close_app, "Close the floating tool. Double-click to close with testcase status.", 180, 9, False),
-            ("Move", None, "Drag this button to move the floating tool.", 225, 8, True),
-            ("New", self.create_new_document, "Create a new Word document.", 270, 10, False),
-            ("File", self.document_manager.select_document, "Open an existing Word document.", 315, 10, False),
+            ("Preview", self.preview_manager.open_window, "Browse earlier screenshots and add yellow highlights.", 51, 8, False),
+            ("Draw", self.drawing_manager.toggle, "Show drawing tools.", 103, 9, False),
+            ("Close", self.close_app, "Close the floating tool. Double-click to close with testcase status.", 154, 9, False),
+            ("Move", None, "Drag this button to move the floating tool.", 206, 8, True),
+            ("New", self.create_new_document, "Create a new Word document.", 257, 10, False),
+            ("File", self.document_manager.select_document, "Open an existing Word document.", 309, 10, False),
         ]
 
         for label, command, tooltip_text, angle_deg, label_size, is_move in button_specs:
@@ -2199,15 +2258,15 @@ class App:
             "- Clears the note after the capture is saved.\n"
             f"- Keyboard shortcut: {SHOT_SHORTCUT_LABEL}\n"
             f"- Taskbar-free shortcut: {WORKAREA_SHORTCUT_LABEL}\n\n"
+            "Draw button\n"
+            "- Shows drawing tools for the next screenshot.\n"
+            f"- Keyboard shortcut: {DRAW_SHORTCUT_LABEL}\n\n"
             "Preview button\n"
             "- Opens a compact screenshot preview window.\n"
             "- Lets you move through saved screenshots one by one.\n"
             "- You can drag a yellow marker on top of the selected screenshot.\n"
             "- Save Highlight updates the selected screenshot instead of creating a duplicate copy.\n"
             "- Delete removes the selected screenshot from the preview list and screenshots folder.\n\n"
-            "i button\n"
-            "- Opens this help window.\n"
-            "- You can scroll here to read all instructions.\n\n"
             "Close button\n"
             "- Click Close to finish normally.\n"
             "- Double-click Close to choose Passed, Failed, or Pending before closing.\n"
@@ -2311,7 +2370,7 @@ class App:
             if note_runs:
                 note_element = self.document_manager.add_note_runs(note_runs)
 
-            self.document_manager.append_image(img_path, width=Inches(5), note_element=note_element)
+            self.document_manager.append_image(img_path, note_element=note_element)
             set_preview_note(img_path, note_text)
             self.document_manager.save()
         except Exception as exc:
