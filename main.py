@@ -26,6 +26,12 @@ PRIMARY_GREY = "#7a8494"
 BUTTON_SHADOW = "#d3d3d3"
 SCREENSHOT_DIR = "screenshots"
 PREVIEW_NOTES_FILE = "preview_notes.json"
+TEST_METADATA_KEY = "__test_metadata__"
+TEST_METADATA_FIELDS = (
+    ("scenario", "Test Scenario"),
+    ("expected_result", "Expected Result"),
+    ("test_data", "Test Data"),
+)
 CARD_BG = "#ffffff"
 TEXT_DARK = "#20304a"
 BASE_WIDTH = 420
@@ -145,6 +151,23 @@ def remove_preview_note(image_path):
         save_preview_notes(notes)
 
 
+def get_preview_metadata():
+    metadata = load_preview_notes().get(TEST_METADATA_KEY, {})
+    if not isinstance(metadata, dict):
+        return {key: "" for key, _label in TEST_METADATA_FIELDS}
+    return {key: str(metadata.get(key, "")) for key, _label in TEST_METADATA_FIELDS}
+
+
+def set_preview_metadata(metadata):
+    notes = load_preview_notes()
+    cleaned = {key: str(metadata.get(key, "")).strip() for key, _label in TEST_METADATA_FIELDS}
+    if any(cleaned.values()):
+        notes[TEST_METADATA_KEY] = cleaned
+    else:
+        notes.pop(TEST_METADATA_KEY, None)
+    save_preview_notes(notes)
+
+
 def clear_screenshot_dir():
     screenshot_dir = ensure_screenshot_dir()
     removed_count = 0
@@ -214,6 +237,7 @@ class DocumentManager:
         self.path = None
         self.tracked_images = {}
         self.tracked_notes = {}
+        self.metadata_elements = []
 
     def has_document(self):
         return self.document is not None and self.path is not None
@@ -236,7 +260,10 @@ class DocumentManager:
             self.path = file_path
             self.tracked_images.clear()
             self.tracked_notes.clear()
+            self.metadata_elements.clear()
             imported_count = self.import_document_preview_items()
+            if self.app.preview_manager.is_visible():
+                self.app.preview_manager.update_canvas()
             if imported_count:
                 self.app.preview_manager.refresh_paths()
                 self.app.set_status(f"Selected: {os.path.basename(file_path)}. Loaded {imported_count} preview image(s).")
@@ -254,8 +281,11 @@ class DocumentManager:
             self.path = os.path.abspath(filename)
             self.tracked_images.clear()
             self.tracked_notes.clear()
+            self.metadata_elements.clear()
             clear_screenshot_dir()
             self.app.preview_manager.refresh_paths()
+            if self.app.preview_manager.is_visible():
+                self.app.preview_manager.update_canvas()
             self.app.set_status(f"Created: {os.path.basename(self.path)}")
             return True
         except Exception as exc:
@@ -327,6 +357,74 @@ class DocumentManager:
                 run.italic = True
         return paragraph._element
 
+    def set_test_metadata(self, metadata):
+        if not self.has_document():
+            return False
+
+        cleaned = {key: str(metadata.get(key, "")).strip() for key, _label in TEST_METADATA_FIELDS}
+        self._remove_test_metadata_block()
+        if not any(cleaned.values()):
+            self.save()
+            return True
+
+        anchor = self._metadata_anchor()
+        inserted_elements = []
+        for key, label in reversed(TEST_METADATA_FIELDS):
+            value = cleaned.get(key, "")
+            if not value:
+                continue
+            paragraph = self.document.add_paragraph()
+            label_run = paragraph.add_run(f"{label}:")
+            label_run.bold = True
+            if value:
+                paragraph.add_run(f"\n{value}")
+            paragraph.paragraph_format.space_after = Pt(6)
+            element = paragraph._element
+            if anchor is not None:
+                anchor.addnext(element)
+            inserted_elements.insert(0, element)
+
+        self.metadata_elements = inserted_elements
+        self.save()
+        return True
+
+    def get_test_metadata(self):
+        metadata = {key: "" for key, _label in TEST_METADATA_FIELDS}
+        if not self.has_document():
+            return metadata
+
+        for paragraph in self.document.paragraphs:
+            text = paragraph.text.strip()
+            for key, label in TEST_METADATA_FIELDS:
+                prefix = f"{label}:"
+                if text.startswith(prefix):
+                    metadata[key] = text[len(prefix):].strip()
+                    if paragraph._element not in self.metadata_elements:
+                        self.metadata_elements.append(paragraph._element)
+        return metadata
+
+    def _metadata_anchor(self):
+        for paragraph in self.document.paragraphs:
+            if paragraph.text.strip():
+                return paragraph._element
+        return None
+
+    def _is_test_metadata_paragraph(self, paragraph):
+        text = paragraph.text.strip()
+        return any(text.startswith(f"{label}:") for _key, label in TEST_METADATA_FIELDS)
+
+    def _remove_test_metadata_block(self):
+        elements = list(self.metadata_elements)
+        for paragraph in self.document.paragraphs:
+            if self._is_test_metadata_paragraph(paragraph) and paragraph._element not in elements:
+                elements.append(paragraph._element)
+
+        for element in elements:
+            parent = element.getparent()
+            if parent is not None:
+                parent.remove(element)
+        self.metadata_elements.clear()
+
     def append_testcase_status(self, status_key):
         if not self.has_document():
             return False
@@ -395,12 +493,15 @@ class DocumentManager:
             return 0
 
         clear_screenshot_dir()
+        set_preview_metadata(self.get_test_metadata())
         imported_count = 0
         pending_note_parts = []
 
         for paragraph in self.document.paragraphs:
             image_rids = paragraph._element.xpath(".//a:blip/@r:embed")
             if not image_rids:
+                if self._is_test_metadata_paragraph(paragraph):
+                    continue
                 text = paragraph.text.strip()
                 if text:
                     pending_note_parts.append(text)
@@ -688,8 +789,12 @@ class PreviewManager:
         self.document_manager = document_manager
         self.window = None
         self.canvas = None
+        self.action_bar = None
+        self.metadata_frame = None
+        self.metadata_textboxes = {}
         self.note_textbox = None
         self.note_save_after_id = None
+        self.metadata_save_after_id = None
         self.index_var = None
         self.buttons = {}
         self.paths = []
@@ -710,7 +815,9 @@ class PreviewManager:
         self.preview_drag_origin = None
         self.last_point = None
         self.loading_note = False
+        self.loading_metadata = False
         self.current_note_cache = ""
+        self.current_metadata_cache = None
         self.canvas_update_after_id = None
         self.is_interacting = False
 
@@ -730,12 +837,17 @@ class PreviewManager:
 
     def refresh_paths(self):
         self.paths = list_saved_screenshots()
-        if self.current_index >= len(self.paths):
-            self.current_index = max(0, len(self.paths) - 1)
+        if self.paths:
+            if self.current_index >= len(self.paths):
+                self.current_index = len(self.paths) - 1
+            if self.current_index < -1:
+                self.current_index = -1
+        else:
+            self.current_index = -1
         return self.paths
 
     def _current_path(self):
-        return self.paths[self.current_index] if self.paths else None
+        return self.paths[self.current_index] if self.paths and self.current_index >= 0 else None
 
     def open_window(self):
         if self.window is not None and self.window.winfo_exists():
@@ -890,6 +1002,33 @@ class PreviewManager:
         )
         self.buttons["delete"].pack(side="right")
 
+        self.metadata_frame = tk.Frame(self.window, bg=CARD_BG)
+        for key, label in TEST_METADATA_FIELDS:
+            tk.Label(
+                self.metadata_frame,
+                text=label,
+                bg=CARD_BG,
+                fg=TEXT_DARK,
+                font=("Segoe UI Semibold", 10),
+            ).pack(anchor="w", padx=14, pady=(8 if key == "scenario" else 10, 4))
+            textbox = tk.Text(
+                self.metadata_frame,
+                height=4,
+                wrap="word",
+                font=("Segoe UI", 10),
+                bd=1,
+                relief="solid",
+                padx=10,
+                pady=7,
+                fg=TEXT_DARK,
+                highlightthickness=1,
+                highlightbackground="#d9deea",
+            )
+            textbox.pack(fill="x", padx=14)
+            textbox.bind("<KeyRelease>", self.schedule_metadata_save)
+            textbox.bind("<FocusOut>", self.save_metadata)
+            self.metadata_textboxes[key] = textbox
+
         self.note_textbox = tk.Text(
             self.window,
             height=3,
@@ -922,11 +1061,11 @@ class PreviewManager:
         self.canvas.bind("<B1-Motion>", self.drag_interaction)
         self.canvas.bind("<ButtonRelease-1>", self.end_interaction)
 
-        action_bar = tk.Frame(self.window, bg=CARD_BG)
-        action_bar.pack(fill="x", padx=14, pady=(0, 12))
+        self.action_bar = tk.Frame(self.window, bg=CARD_BG)
+        self.action_bar.pack(fill="x", padx=14, pady=(0, 12))
 
         tk.Button(
-            action_bar,
+            self.action_bar,
             text="Reset",
             command=self.reset_highlight,
             relief="flat",
@@ -942,6 +1081,7 @@ class PreviewManager:
         self.show_at(len(self.refresh_paths()) - 1)
 
     def close_window(self):
+        self.save_metadata()
         self.save_current_note()
         if self.window is not None and self.window.winfo_exists():
             self.window.destroy()
@@ -952,10 +1092,16 @@ class PreviewManager:
             self.window.after_cancel(self.canvas_update_after_id)
         if self.note_save_after_id is not None and self.window is not None and self.window.winfo_exists():
             self.window.after_cancel(self.note_save_after_id)
+        if self.metadata_save_after_id is not None and self.window is not None and self.window.winfo_exists():
+            self.window.after_cancel(self.metadata_save_after_id)
         self.window = None
         self.canvas = None
+        self.action_bar = None
+        self.metadata_frame = None
+        self.metadata_textboxes.clear()
         self.note_textbox = None
         self.note_save_after_id = None
+        self.metadata_save_after_id = None
         self.index_var = None
         self.buttons.clear()
         self.paths = []
@@ -976,12 +1122,18 @@ class PreviewManager:
         self.preview_drag_origin = None
         self.last_point = None
         self.loading_note = False
+        self.loading_metadata = False
         self.current_note_cache = ""
+        self.current_metadata_cache = None
         self.canvas_update_after_id = None
         self.is_interacting = False
 
     def show_at(self, index):
-        self.current_index = max(0, min(index, len(self.paths) - 1)) if self.paths else 0
+        if self.current_index == -1:
+            self.save_metadata()
+        else:
+            self.save_current_note()
+        self.current_index = max(-1, min(index, len(self.paths) - 1)) if self.paths else -1
         self.update_canvas()
 
     def zoom_view(self, delta):
@@ -1088,6 +1240,11 @@ class PreviewManager:
             self.canvas_update_after_id = None
 
         self.refresh_paths()
+        if self.current_index == -1:
+            self._show_metadata_page()
+            return
+
+        self._show_screenshot_page()
         if not self.paths:
             self.canvas.delete("all")
             self.canvas.create_text(
@@ -1156,6 +1313,47 @@ class PreviewManager:
             self.index_var.set(f"{self.current_index + 1} / {len(self.paths)}")
         self._set_controls_enabled(True)
 
+    def _show_metadata_page(self):
+        self.current_image_path = None
+        self.base_image = None
+        self.annotated_image = None
+        self.annotation_draw = None
+        self.dirty = False
+        if self.note_textbox is not None and self.note_textbox.winfo_manager():
+            self.note_textbox.pack_forget()
+        if self.canvas is not None and self.canvas.winfo_manager():
+            self.canvas.pack_forget()
+        if self.action_bar is not None and self.action_bar.winfo_manager():
+            self.action_bar.pack_forget()
+        if self.metadata_frame is not None and not self.metadata_frame.winfo_manager():
+            self.metadata_frame.pack(fill="both", expand=True, padx=0, pady=(0, 10))
+        self.load_metadata()
+        if self.index_var is not None:
+            self.index_var.set("Details")
+        self._set_metadata_controls()
+
+    def _show_screenshot_page(self):
+        if self.metadata_frame is not None and self.metadata_frame.winfo_manager():
+            self.metadata_frame.pack_forget()
+        if self.note_textbox is not None and not self.note_textbox.winfo_manager():
+            self.note_textbox.pack(fill="x", padx=14, pady=(0, 10))
+        if self.canvas is not None and not self.canvas.winfo_manager():
+            self.canvas.pack(fill="both", expand=True, padx=14, pady=(0, 10))
+        if self.action_bar is not None and not self.action_bar.winfo_manager():
+            self.action_bar.pack(fill="x", padx=14, pady=(0, 12))
+
+    def _set_metadata_controls(self):
+        for key in ("zoom_in", "zoom_out", "pan", "highlight", "brush_S", "brush_M", "brush_L", "brush_XL", "delete"):
+            button = self.buttons.get(key)
+            if button is not None and button.winfo_exists():
+                button.configure(state="disabled")
+        prev_button = self.buttons.get("prev")
+        if prev_button is not None and prev_button.winfo_exists():
+            prev_button.configure(state="disabled")
+        next_button = self.buttons.get("next")
+        if next_button is not None and next_button.winfo_exists():
+            next_button.configure(state="normal" if self.paths else "disabled")
+
     def load_note_for_current_image(self):
         if self.note_textbox is None or not self.note_textbox.winfo_exists():
             return
@@ -1190,6 +1388,51 @@ class PreviewManager:
         set_preview_note(self.current_image_path, note_text)
         self.document_manager.set_image_note(self.current_image_path, note_text)
         self.current_note_cache = note_text
+
+    def load_metadata(self):
+        if not self.metadata_textboxes:
+            return
+        if self.loading_metadata:
+            return
+
+        metadata = get_preview_metadata()
+        self.loading_metadata = True
+        for key, textbox in self.metadata_textboxes.items():
+            if textbox is None or not textbox.winfo_exists():
+                continue
+            textbox.delete("1.0", tk.END)
+            textbox.insert("1.0", metadata.get(key, ""))
+        self.current_metadata_cache = metadata
+        self.loading_metadata = False
+
+    def schedule_metadata_save(self, _event=None):
+        if self.loading_metadata or self.window is None or not self.window.winfo_exists():
+            return
+        if self.metadata_save_after_id is not None:
+            self.window.after_cancel(self.metadata_save_after_id)
+        self.metadata_save_after_id = self.window.after(800, self.save_metadata)
+
+    def save_metadata(self, _event=None):
+        if self.metadata_save_after_id is not None and self.window is not None and self.window.winfo_exists():
+            self.window.after_cancel(self.metadata_save_after_id)
+            self.metadata_save_after_id = None
+        if not self.metadata_textboxes:
+            return
+
+        metadata = {}
+        for key, textbox in self.metadata_textboxes.items():
+            if textbox is None or not textbox.winfo_exists():
+                metadata[key] = self.current_metadata_cache.get(key, "") if self.current_metadata_cache is not None else ""
+                continue
+            metadata[key] = textbox.get("1.0", tk.END).strip()
+
+        if self.current_metadata_cache is None:
+            return
+        if metadata == self.current_metadata_cache:
+            return
+        set_preview_metadata(metadata)
+        self.document_manager.set_test_metadata(metadata)
+        self.current_metadata_cache = metadata
 
     def _set_controls_enabled(self, enabled):
         state = "normal" if enabled else "disabled"
@@ -2323,6 +2566,7 @@ class App:
         if self.note_manager.is_visible():
             self.note_manager.save(close_after=False)
         if self.preview_manager.is_visible():
+            self.preview_manager.save_metadata()
             self.preview_manager.save_current_note()
         self.drawing_manager.prepare_for_capture()
 
@@ -2568,6 +2812,8 @@ class App:
         self.set_status("Saving and closing...")
         self.root.update_idletasks()
         try:
+            self.preview_manager.save_metadata()
+            self.preview_manager.save_current_note()
             self.note_manager.append_pending_note_to_document()
             if testcase_status is not None:
                 self.document_manager.append_testcase_status(testcase_status)
