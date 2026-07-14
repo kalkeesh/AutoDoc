@@ -3,9 +3,11 @@ from datetime import datetime
 from tkinter import filedialog, messagebox
 
 from docx import Document
+from docx.enum.table import WD_ROW_HEIGHT_RULE
 from docx.enum.text import WD_ALIGN_PARAGRAPH
 from docx.oxml import OxmlElement
-from docx.shared import Pt, RGBColor
+from docx.oxml.ns import qn
+from docx.shared import Inches, Pt, RGBColor
 from docx.text.paragraph import Paragraph
 
 from .config import TEST_METADATA_FIELDS, TESTCASE_STATUS_OPTIONS
@@ -19,6 +21,7 @@ class DocumentManager:
         self.path = None
         self.tracked_images = {}
         self.tracked_notes = {}
+        self.tracked_tables = {}
         self.metadata_elements = []
 
     def has_document(self):
@@ -42,6 +45,7 @@ class DocumentManager:
             self.path = file_path
             self.tracked_images.clear()
             self.tracked_notes.clear()
+            self.tracked_tables.clear()
             self.metadata_elements.clear()
             imported_count = self.import_document_preview_items()
             if self.app.preview_manager.is_visible():
@@ -63,6 +67,7 @@ class DocumentManager:
             self.path = os.path.abspath(filename)
             self.tracked_images.clear()
             self.tracked_notes.clear()
+            self.tracked_tables.clear()
             self.metadata_elements.clear()
             clear_screenshot_dir()
             self.app.preview_manager.refresh_paths()
@@ -80,6 +85,9 @@ class DocumentManager:
     def _page_content_width(self):
         section = self.document.sections[-1]
         return section.page_width - section.left_margin - section.right_margin
+
+    def _paragraph_text(self, paragraph):
+        return (getattr(paragraph, "text", None) or "").strip()
 
     def append_image(self, image_path, width=None, note_element=None):
         if not self.has_document() or not image_path:
@@ -119,6 +127,7 @@ class DocumentManager:
                 note_parent = note_element.getparent()
                 if note_parent is not None:
                     note_parent.remove(note_element)
+            self._remove_tracked_tables(absolute_path)
         return True
 
     def add_note_runs(self, runs):
@@ -130,13 +139,12 @@ class DocumentManager:
             if not text:
                 continue
             run = paragraph.add_run(text)
-            if style == "bold":
+            if "bold" in style:
                 run.bold = True
-            elif style == "italic":
+            if "italic" in style:
                 run.italic = True
-            elif style == "bold_italic":
-                run.bold = True
-                run.italic = True
+            if "underline" in style:
+                run.underline = True
         return paragraph._element
 
     def set_test_metadata(self, metadata):
@@ -176,7 +184,7 @@ class DocumentManager:
             return metadata
 
         for paragraph in self.document.paragraphs:
-            text = paragraph.text.strip()
+            text = self._paragraph_text(paragraph)
             for key, label in TEST_METADATA_FIELDS:
                 prefix = f"{label}:"
                 if text.startswith(prefix):
@@ -187,12 +195,12 @@ class DocumentManager:
 
     def _metadata_anchor(self):
         for paragraph in self.document.paragraphs:
-            if paragraph.text.strip():
+            if self._paragraph_text(paragraph):
                 return paragraph._element
         return None
 
     def _is_test_metadata_paragraph(self, paragraph):
-        text = paragraph.text.strip()
+        text = self._paragraph_text(paragraph)
         return any(text.startswith(f"{label}:") for _key, label in TEST_METADATA_FIELDS)
 
     def _remove_test_metadata_block(self):
@@ -270,6 +278,77 @@ class DocumentManager:
             paragraph.add_run(note_text)
         self.save()
 
+    def set_image_tables(self, image_path, tables):
+        if not self.has_document() or not image_path:
+            return
+
+        absolute_path = self._normalize_path(image_path)
+        image_element = self.tracked_images.get(absolute_path)
+        if image_element is None:
+            return
+
+        self._remove_tracked_tables(absolute_path)
+        inserted_elements = []
+        for table_data in reversed(tables or []):
+            rows = max(1, int(table_data.get("rows") or 1))
+            columns = max(1, int(table_data.get("columns") or 1))
+            data = table_data.get("data") if isinstance(table_data.get("data"), list) else []
+            column_widths = table_data.get("column_widths") if isinstance(table_data.get("column_widths"), list) else []
+            row_heights = table_data.get("row_heights") if isinstance(table_data.get("row_heights"), list) else []
+
+            table = self.document.add_table(rows=rows, cols=columns)
+            table.style = "Table Grid"
+            self._set_table_borders(table)
+            for row_index, row in enumerate(table.rows):
+                if row_index < len(row_heights):
+                    try:
+                        row.height = Pt(max(18, min(180, int(row_heights[row_index]) * 0.75)))
+                        row.height_rule = WD_ROW_HEIGHT_RULE.AT_LEAST
+                    except (TypeError, ValueError):
+                        pass
+                row_values = data[row_index] if row_index < len(data) and isinstance(data[row_index], list) else []
+                for column_index, cell in enumerate(row.cells):
+                    cell.text = str(row_values[column_index]) if column_index < len(row_values) else ""
+                    if column_index < len(column_widths):
+                        try:
+                            cell.width = Inches(max(0.5, min(3.2, int(column_widths[column_index]) / 96)))
+                        except (TypeError, ValueError):
+                            pass
+
+            table_element = table._element
+            parent = table_element.getparent()
+            if parent is not None:
+                parent.remove(table_element)
+            image_element.addprevious(table_element)
+            inserted_elements.insert(0, table_element)
+
+        if inserted_elements:
+            self.tracked_tables[absolute_path] = inserted_elements
+        self.save()
+
+    def _set_table_borders(self, table):
+        tbl_pr = table._element.tblPr
+        borders = tbl_pr.first_child_found_in("w:tblBorders")
+        if borders is None:
+            borders = OxmlElement("w:tblBorders")
+            tbl_pr.append(borders)
+        for edge in ("top", "left", "bottom", "right", "insideH", "insideV"):
+            element = borders.find(qn(f"w:{edge}"))
+            if element is None:
+                element = OxmlElement(f"w:{edge}")
+                borders.append(element)
+            element.set(qn("w:val"), "single")
+            element.set(qn("w:sz"), "4")
+            element.set(qn("w:space"), "0")
+            element.set(qn("w:color"), "000000")
+
+    def _remove_tracked_tables(self, absolute_path):
+        table_elements = self.tracked_tables.pop(absolute_path, [])
+        for table_element in table_elements:
+            parent = table_element.getparent()
+            if parent is not None:
+                parent.remove(table_element)
+
     def import_document_preview_items(self):
         if not self.has_document():
             return 0
@@ -284,7 +363,7 @@ class DocumentManager:
             if not image_rids:
                 if self._is_test_metadata_paragraph(paragraph):
                     continue
-                text = paragraph.text.strip()
+                text = self._paragraph_text(paragraph)
                 if text:
                     pending_note_parts.append(text)
                 continue
@@ -319,7 +398,7 @@ class DocumentManager:
         previous = image_element.getprevious()
         while previous is not None:
             paragraph = Paragraph(previous, self.document)
-            if paragraph.text.strip():
+            if self._paragraph_text(paragraph):
                 return previous
             previous = previous.getprevious()
         return None

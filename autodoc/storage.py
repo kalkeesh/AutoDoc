@@ -2,7 +2,7 @@
 import os
 import shutil
 
-from .config import PREVIEW_NOTES_FILE, SCREENSHOT_DIR, TEST_METADATA_FIELDS, TEST_METADATA_KEY
+from .config import PREVIEW_NOTES_FILE, PREVIEW_TABLES_KEY, SCREENSHOT_DIR, TEST_METADATA_FIELDS, TEST_METADATA_KEY
 
 def ensure_screenshot_dir():
     os.makedirs(SCREENSHOT_DIR, exist_ok=True)
@@ -74,6 +74,106 @@ def remove_preview_note(image_path):
         return
     notes = load_preview_notes()
     if notes.pop(os.path.basename(image_path), None) is not None:
+        save_preview_notes(notes)
+
+
+def _blank_table(rows, columns):
+    return {
+        "rows": max(1, int(rows)),
+        "columns": max(1, int(columns)),
+        "data": [["" for _column in range(max(1, int(columns)))] for _row in range(max(1, int(rows)))],
+        "column_widths": [140 for _column in range(max(1, int(columns)))],
+        "row_heights": [36 for _row in range(max(1, int(rows)))],
+    }
+
+
+def normalize_preview_table(table):
+    if not isinstance(table, dict):
+        return _blank_table(2, 2)
+
+    rows = max(1, int(table.get("rows") or 1))
+    columns = max(1, int(table.get("columns") or 1))
+    raw_data = table.get("data") if isinstance(table.get("data"), list) else []
+    data = []
+    for row_index in range(rows):
+        raw_row = raw_data[row_index] if row_index < len(raw_data) and isinstance(raw_data[row_index], list) else []
+        data.append([str(raw_row[column_index]) if column_index < len(raw_row) else "" for column_index in range(columns)])
+
+    raw_widths = table.get("column_widths") if isinstance(table.get("column_widths"), list) else []
+    column_widths = []
+    for column_index in range(columns):
+        value = raw_widths[column_index] if column_index < len(raw_widths) else 140
+        try:
+            width = int(value)
+        except (TypeError, ValueError):
+            width = 140
+        column_widths.append(max(70, min(420, width)))
+
+    raw_heights = table.get("row_heights") if isinstance(table.get("row_heights"), list) else []
+    row_heights = []
+    for row_index in range(rows):
+        value = raw_heights[row_index] if row_index < len(raw_heights) else 36
+        try:
+            height = int(value)
+        except (TypeError, ValueError):
+            height = 36
+        row_heights.append(max(30, min(240, height)))
+
+    return {
+        "rows": rows,
+        "columns": columns,
+        "data": data,
+        "column_widths": column_widths,
+        "row_heights": row_heights,
+    }
+
+
+def get_preview_tables(image_path):
+    if not image_path:
+        return []
+    tables_by_image = load_preview_notes().get(PREVIEW_TABLES_KEY, {})
+    if not isinstance(tables_by_image, dict):
+        return []
+    tables = tables_by_image.get(os.path.basename(image_path), [])
+    if not isinstance(tables, list):
+        return []
+    return [normalize_preview_table(table) for table in tables]
+
+
+def set_preview_tables(image_path, tables):
+    if not image_path:
+        return
+    notes = load_preview_notes()
+    tables_by_image = notes.get(PREVIEW_TABLES_KEY, {})
+    if not isinstance(tables_by_image, dict):
+        tables_by_image = {}
+
+    cleaned = [normalize_preview_table(table) for table in tables if isinstance(table, dict)]
+    key = os.path.basename(image_path)
+    if cleaned:
+        tables_by_image[key] = cleaned
+    else:
+        tables_by_image.pop(key, None)
+
+    if tables_by_image:
+        notes[PREVIEW_TABLES_KEY] = tables_by_image
+    else:
+        notes.pop(PREVIEW_TABLES_KEY, None)
+    save_preview_notes(notes)
+
+
+def remove_preview_tables(image_path):
+    if not image_path:
+        return
+    notes = load_preview_notes()
+    tables_by_image = notes.get(PREVIEW_TABLES_KEY, {})
+    if not isinstance(tables_by_image, dict):
+        return
+    if tables_by_image.pop(os.path.basename(image_path), None) is not None:
+        if tables_by_image:
+            notes[PREVIEW_TABLES_KEY] = tables_by_image
+        else:
+            notes.pop(PREVIEW_TABLES_KEY, None)
         save_preview_notes(notes)
 
 

@@ -2,6 +2,7 @@ pyautogui
 python-docx
 Pillow
 lxml
+github-copilot-sdk
 pygetwindow
 pymsgbox
 pyperclip

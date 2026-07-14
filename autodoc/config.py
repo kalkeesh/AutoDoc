@@ -9,6 +9,7 @@ BUTTON_SHADOW = "#d3d3d3"
 SCREENSHOT_DIR = "screenshots"
 PREVIEW_NOTES_FILE = "preview_notes.json"
 TEST_METADATA_KEY = "__test_metadata__"
+PREVIEW_TABLES_KEY = "__preview_tables__"
 TEST_METADATA_FIELDS = (
     ("scenario", "Test Scenario"),
     ("expected_result", "Expected Result"),

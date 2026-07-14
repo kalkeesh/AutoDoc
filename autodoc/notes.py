@@ -11,6 +11,7 @@ class NoteManager:
         self.textbox = None
         self.bold_button = None
         self.italic_button = None
+        self.underline_button = None
 
     def get_note_text(self):
         if self.window and self.window.winfo_exists() and self.textbox:
@@ -31,7 +32,7 @@ class NoteManager:
         self.current_note_text = ""
         if self.textbox is not None:
             self.textbox.delete("1.0", tk.END)
-            for tag_name in ("bold", "italic", "bold_italic"):
+            for tag_name in self._style_tags():
                 self.textbox.tag_remove(tag_name, "1.0", tk.END)
         self.update_style_buttons()
         self.app.set_status("Note cleared.")
@@ -78,6 +79,9 @@ class NoteManager:
         self.italic_button = tk.Button(toolbar, text="Italic", width=8, command=self.toggle_italic, relief="flat")
         self.italic_button.pack(side="left", padx=(0, 8))
 
+        self.underline_button = tk.Button(toolbar, text="Underline", width=10, command=self.toggle_underline, relief="flat")
+        self.underline_button.pack(side="left", padx=(0, 8))
+
         clear_button = tk.Button(
             toolbar,
             text="Clear",
@@ -107,6 +111,12 @@ class NoteManager:
         self.textbox.bind("<<Selection>>", lambda _event: self.update_style_buttons())
         self.textbox.bind("<ButtonRelease-1>", lambda _event: self.update_style_buttons())
         self.textbox.bind("<KeyRelease>", lambda _event: self.update_style_buttons())
+        self.textbox.bind("<Control-b>", lambda _event: self._shortcut_style("bold"))
+        self.textbox.bind("<Control-B>", lambda _event: self._shortcut_style("bold"))
+        self.textbox.bind("<Control-i>", lambda _event: self._shortcut_style("italic"))
+        self.textbox.bind("<Control-I>", lambda _event: self._shortcut_style("italic"))
+        self.textbox.bind("<Control-u>", lambda _event: self._shortcut_style("underline"))
+        self.textbox.bind("<Control-U>", lambda _event: self._shortcut_style("underline"))
 
         action_bar = tk.Frame(self.window, bg=CARD_BG)
         action_bar.pack(fill="x", padx=16, pady=(0, 14))
@@ -131,9 +141,10 @@ class NoteManager:
     def configure_text_tags(self):
         if self.textbox is None:
             return
-        self.textbox.tag_configure("bold", font=("Segoe UI", 10, "bold"))
-        self.textbox.tag_configure("italic", font=("Segoe UI", 10, "italic"))
-        self.textbox.tag_configure("bold_italic", font=("Segoe UI", 10, "bold italic"))
+        for tag_name in self._style_tags():
+            parts = tag_name.split("_")
+            options = " ".join(parts)
+            self.textbox.tag_configure(tag_name, font=("Segoe UI", 10, options))
 
     def update_style_buttons(self):
         if self.window is None or not self.window.winfo_exists() or self.textbox is None:
@@ -142,12 +153,20 @@ class NoteManager:
         state = "normal" if has_selection else "disabled"
         self.bold_button.configure(bg="#e8edff", fg=TEXT_DARK, state=state)
         self.italic_button.configure(bg="#e8edff", fg=TEXT_DARK, state=state)
+        self.underline_button.configure(bg="#e8edff", fg=TEXT_DARK, state=state)
 
     def toggle_bold(self):
         self._toggle_selected_text_style("bold")
 
     def toggle_italic(self):
         self._toggle_selected_text_style("italic")
+
+    def toggle_underline(self):
+        self._toggle_selected_text_style("underline")
+
+    def _shortcut_style(self, style_name):
+        self._toggle_selected_text_style(style_name)
+        return "break"
 
     def _toggle_selected_text_style(self, style_name):
         if self.textbox is None or not self.textbox.tag_ranges("sel"):
@@ -157,28 +176,43 @@ class NoteManager:
 
         start = self.textbox.index("sel.first")
         end = self.textbox.index("sel.last")
-        has_bold = self._style_range_has_tag("bold", start, end) or self._style_range_has_tag("bold_italic", start, end)
-        has_italic = self._style_range_has_tag("italic", start, end) or self._style_range_has_tag("bold_italic", start, end)
-
-        if style_name == "bold":
-            wants_bold = not has_bold
-            wants_italic = has_italic
+        active_styles = {
+            style
+            for style in ("bold", "italic", "underline")
+            if self._style_range_has_component(style, start, end)
+        }
+        if style_name in active_styles:
+            active_styles.remove(style_name)
         else:
-            wants_bold = has_bold
-            wants_italic = not has_italic
+            active_styles.add(style_name)
 
-        for tag_name in ("bold", "italic", "bold_italic"):
+        for tag_name in self._style_tags():
             self.textbox.tag_remove(tag_name, start, end)
 
-        if wants_bold and wants_italic:
-            self.textbox.tag_add("bold_italic", start, end)
-        elif wants_bold:
-            self.textbox.tag_add("bold", start, end)
-        elif wants_italic:
-            self.textbox.tag_add("italic", start, end)
+        tag_name = self._style_tag_from_components(active_styles)
+        if tag_name:
+            self.textbox.tag_add(tag_name, start, end)
 
         self.update_style_buttons()
         self.textbox.focus_set()
+
+    def _style_tags(self):
+        return (
+            "bold",
+            "italic",
+            "underline",
+            "bold_italic",
+            "bold_underline",
+            "italic_underline",
+            "bold_italic_underline",
+        )
+
+    def _style_tag_from_components(self, components):
+        ordered = [style for style in ("bold", "italic", "underline") if style in components]
+        return "_".join(ordered)
+
+    def _style_range_has_component(self, style_name, start, end):
+        return any(style_name in tag_name.split("_") and self._style_range_has_tag(tag_name, start, end) for tag_name in self._style_tags())
 
     def _style_range_has_tag(self, tag_name, start, end):
         ranges = self.textbox.tag_ranges(tag_name)
@@ -204,14 +238,8 @@ class NoteManager:
             char = self.textbox.get(index, next_index)
             tags = set(self.textbox.tag_names(index))
 
-            if "bold_italic" in tags:
-                style = "bold_italic"
-            elif "bold" in tags:
-                style = "bold"
-            elif "italic" in tags:
-                style = "italic"
-            else:
-                style = "normal"
+            style_tags = [tag_name for tag_name in self._style_tags() if tag_name in tags]
+            style = style_tags[-1] if style_tags else "normal"
 
             if current_style is None:
                 current_style = style
